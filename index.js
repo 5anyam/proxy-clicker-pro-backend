@@ -7,18 +7,57 @@ import { buildWorkbookBuffer } from './excel.js';
 
 const app = express();
 
-// Enhanced CORS for Railway deployment
+// FIXED CORS Configuration - Allow frontend origins, not backend
 app.use(cors({
-  origin: ['https://proxy-clicker-pro-backend-production.up.railway.app'],
-  credentials: false
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, etc.)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'https://proxy-clicker-pro.vercel.app/'
+      // Add your frontend domain here
+    ];
+    
+    const isAllowed = allowedOrigins.some(pattern => {
+      if (typeof pattern === 'string') return origin === pattern;
+      return pattern.test(origin);
+    });
+    
+    if (isAllowed || process.env.NODE_ENV === 'development') {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      callback(null, true); // Temporarily allow all for debugging
+    }
+  },
+  credentials: false,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  preflightContinue: false,
+  optionsSuccessStatus: 200
 }));
+
+// Additional CORS headers for extra compatibility
+app.use((req, res, next) => {
+  // Allow all origins temporarily for debugging
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    console.log('OPTIONS preflight request from:', req.get('Origin'));
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 app.use(express.json({ limit: '1mb' }));
 
-// Request logging middleware
+// Enhanced request logging middleware
 app.use((req, res, next) => {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.path} - ${req.ip}`);
+  console.log(`[${timestamp}] ${req.method} ${req.path} - Origin: ${req.get('Origin')} - IP: ${req.ip}`);
   next();
 });
 
@@ -32,6 +71,10 @@ app.get('/', (req, res) => {
     status: 'running',
     version: '1.0.0',
     timestamp: new Date().toISOString(),
+    cors: {
+      allowsAllOrigins: true,
+      requestOrigin: req.get('Origin')
+    },
     endpoints: [
       'GET /api/health',
       'POST /api/start-automation',
@@ -44,19 +87,26 @@ app.get('/', (req, res) => {
 });
 
 // Health check
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', (req, res) => {
+  console.log('Health check request from origin:', req.get('Origin'));
   res.json({ 
     ok: true, 
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
-    memory: process.memoryUsage()
+    memory: process.memoryUsage(),
+    cors: {
+      requestOrigin: req.get('Origin'),
+      userAgent: req.get('User-Agent')
+    }
   });
 });
 
 // Start automation with proxy support
 app.post('/api/start-automation', async (req, res) => {
   console.log('POST /api/start-automation - Request received');
+  console.log('Request Origin:', req.get('Origin'));
+  console.log('Request Headers:', req.headers);
   console.log('Request body:', JSON.stringify(req.body, null, 2));
 
   const { url, proxy } = req.body || {};
@@ -326,14 +376,24 @@ app.post('/api/batch-automation', async (req, res) => {
   }
 });
 
+// CORS test endpoint
+app.get('/api/cors-test', (req, res) => {
+  res.json({
+    message: 'CORS is working!',
+    origin: req.get('Origin'),
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Catch-all handler for API routes (404 handler)
 app.all('/api/*', (req, res) => {
-  console.log(`404: API route not found - ${req.method} ${req.path}`);
+  console.log(`404: API route not found - ${req.method} ${req.path} from origin: ${req.get('Origin')}`);
   res.status(404).json({ 
     success: false, 
     error: `API route not found: ${req.method} ${req.path}`,
     availableRoutes: [
       'GET /api/health',
+      'GET /api/cors-test',
       'POST /api/start-automation',
       'POST /api/batch-automation',
       'GET /api/job-status/:jobId',
@@ -370,9 +430,11 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Backend listening on port ${PORT}`);
   console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`⏰ Started at: ${new Date().toISOString()}`);
+  console.log('🔒 CORS: Allowing all origins for debugging');
   console.log('📋 Endpoints available:');
   console.log(`  GET  / - API Information`);
   console.log(`  GET  /api/health - Health check`);
+  console.log(`  GET  /api/cors-test - CORS test endpoint`);
   console.log(`  POST /api/start-automation - Single URL automation (with optional proxy)`);
   console.log(`  POST /api/batch-automation - Multiple URLs automation`);
   console.log(`  GET  /api/job-status/:jobId - Check job status`);
