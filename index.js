@@ -9,7 +9,7 @@ const app = express();
 
 // Enhanced CORS for Railway deployment
 app.use(cors({
-  origin: ['http://localhost:3000', 'https://*.up.railway.app', '*'],
+  origin: ['https://proxy-clicker-pro-backend-production.up.railway.app'],
   credentials: false
 }));
 
