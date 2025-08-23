@@ -27,7 +27,7 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
 
   let browser, context;
   let ip = null;
-  const captured = [];
+  let captured = []; // Initialize as empty array
 
   try {
     push('[info] Starting automation...');
@@ -45,187 +45,116 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
 
     push(`[info] Opening: ${targetUrl}`);
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    push('[info] Page loaded successfully');
 
-    // Remove popups/overlays
-    try {
-      const overlay = page.locator('button:has-text("Accept"), button:has-text("OK"), button:has-text("Agree"), [class*="cookie"], [class*="consent"]').first();
-      if (await overlay.isVisible().catch(() => false)) {
-        await overlay.click({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(500);
-      }
-    } catch {}
+    // Wait a bit for dynamic content
+    await page.waitForTimeout(2000);
 
-    // Find main content area (skip header/nav/footer)
-    let contentArea = null;
-    const contentSelectors = ['main', 'article', '.entry-content', '.post-content', '.content', '.blog-content'];
+    // **SIMPLE STRATEGY: Just get ALL visible links on the page**
+    const allLinks = await page.locator('a[href]:visible').all();
+    push(`[info] Found ${allLinks.length} total links on page`);
+
+    const validUrls = [];
     
-    for (const sel of contentSelectors) {
+    // Process first 10 links
+    for (let i = 0; i < Math.min(10, allLinks.length); i++) {
       try {
-        const count = await page.locator(sel).count();
-        if (count > 0) {
-          contentArea = page.locator(sel).first();
-          push(`[info] Content found: ${sel}`);
-          break;
-        }
-      } catch {}
-    }
-    
-    if (!contentArea) {
-      contentArea = page.locator('body');
-      push('[info] Using body as fallback');
-    }
-
-    // **STRATEGY 1: Find ALL links in content and try top 5**
-    const allLinks = await contentArea.locator('a[href]:visible').all();
-    const linkCandidates = [];
-    
-    for (const link of allLinks) {
-      try {
+        const link = allLinks[i];
         const href = await link.getAttribute('href');
-        const text = (await link.innerText().catch(() => '')).trim();
+        const text = (await link.textContent() || '').trim();
         
-        if (!href || href.startsWith('#')) continue;
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) {
+          continue;
+        }
         
         // Make absolute URL
         let fullUrl;
-        if (href.startsWith('http')) {
-          fullUrl = href;
-        } else {
-          try {
+        try {
+          if (href.startsWith('http')) {
+            fullUrl = href;
+          } else {
             fullUrl = new URL(href, targetUrl).toString();
-          } catch {
-            continue;
           }
+        } catch {
+          continue;
         }
         
-        linkCandidates.push({ 
-          element: link, 
-          url: fullUrl, 
+        // Skip same domain exact matches
+        if (fullUrl === targetUrl) {
+          continue;
+        }
+        
+        validUrls.push({
+          url: fullUrl,
           text: text || href,
-          method: 'content-link'
+          index: i + 1
         });
         
-        if (linkCandidates.length >= 10) break;
-      } catch {}
-    }
-
-    push(`[info] Found ${linkCandidates.length} link candidates`);
-
-    // **STRATEGY 2: Try clicking first 3 links and capture their target URLs**
-    for (let i = 0; i < Math.min(3, linkCandidates.length); i++) {
-      const candidate = linkCandidates[i];
-      push(`[info] Trying link ${i+1}: "${candidate.text}"`);
-
-      try {
-        // Check if link opens in new tab
-        const target = await candidate.element.getAttribute('target');
+        push(`[found] Link ${i+1}: ${fullUrl}`);
         
-        if (target === '_blank') {
-          // New tab case
-          try {
-            const [newPage] = await Promise.all([
-              context.waitForEvent('page', { timeout: 5000 }),
-              candidate.element.click({ timeout: 5000 })
-            ]);
-            await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 });
-            const newUrl = newPage.url();
-            await newPage.close();
-            
-            captured.push({
-              url: newUrl,
-              source: targetUrl,
-              timestamp: new Date().toISOString(),
-              method: 'new-tab-click',
-              buttonText: candidate.text,
-              ip,
-              proxy: proxyConfig || null
-            });
-            push(`[capture] New tab: ${newUrl}`);
-          } catch (clickErr) {
-            push(`[warn] New tab click failed: ${clickErr.message}`);
-          }
-        } else {
-          // **DIRECT URL APPROACH: If click fails, just use the href**
-          captured.push({
-            url: candidate.url,
-            source: targetUrl,
-            timestamp: new Date().toISOString(),
-            method: 'href-direct',
-            buttonText: candidate.text,
-            ip,
-            proxy: proxyConfig || null
-          });
-          push(`[capture] Direct href: ${candidate.url}`);
-        }
-      } catch (err) {
-        push(`[warn] Link ${i+1} failed: ${err.message}`);
+        if (validUrls.length >= 5) break; // Limit to 5
+        
+      } catch (linkErr) {
+        push(`[warn] Error processing link ${i+1}: ${linkErr.message}`);
       }
     }
 
-    // **STRATEGY 3: If no links, find buttons and external forms**
-    if (captured.length === 0) {
-      const buttons = await contentArea.locator('button:visible, [role="button"]:visible, input[type="submit"]:visible').all();
-      push(`[info] Found ${buttons.length} buttons as fallback`);
-      
-      for (let i = 0; i < Math.min(2, buttons.length); i++) {
-        try {
-          const btn = buttons[i];
-          const text = (await btn.innerText().catch(() => '')).trim() || 
-                       (await btn.getAttribute('value').catch(() => '')) || 
-                       `Button ${i+1}`;
-          
-          push(`[info] Trying button: "${text}"`);
-          
-          // Try clicking button and wait for navigation
-          try {
-            await Promise.all([
-              page.waitForNavigation({ timeout: 8000 }).catch(() => null),
-              btn.click({ timeout: 5000 })
-            ]);
-            
-            await page.waitForTimeout(1000);
-            const newUrl = page.url();
-            
-            if (newUrl !== targetUrl) {
-              captured.push({
-                url: newUrl,
-                source: targetUrl,
-                timestamp: new Date().toISOString(),
-                method: 'button-click',
-                buttonText: text,
-                ip,
-                proxy: proxyConfig || null
-              });
-              push(`[capture] Button nav: ${newUrl}`);
-              break;
-            }
-          } catch (btnErr) {
-            push(`[warn] Button click failed: ${btnErr.message}`);
-          }
-        } catch {}
-      }
+    push(`[info] Valid URLs found: ${validUrls.length}`);
+
+    // **Convert to captured format**
+    for (const urlData of validUrls) {
+      captured.push({
+        url: urlData.url,
+        source: targetUrl,
+        timestamp: new Date().toISOString(),
+        method: 'link-extraction',
+        buttonText: urlData.text,
+        ip: ip,
+        proxy: proxyConfig || null
+      });
     }
 
-    // **FALLBACK: Return original page if nothing captured**
+    // **GUARANTEED: Always return at least original URL if nothing found**
     if (captured.length === 0) {
       captured.push({
         url: targetUrl,
         source: targetUrl,
         timestamp: new Date().toISOString(),
-        method: 'original-page',
-        ip,
+        method: 'original-fallback',
+        ip: ip,
         proxy: proxyConfig || null
       });
-      push('[info] No new URLs found, returned original page');
+      push('[info] No links found, returning original URL');
     }
 
     push(`[success] Completed. Captured ${captured.length} URLs`);
-    return { captured, logs, ip, proxy: proxyConfig || null };
+    
+    // **IMPORTANT: Return in exact format expected by frontend**
+    return { 
+      captured: captured,  // This is the key field
+      logs: logs, 
+      ip: ip, 
+      proxy: proxyConfig || null 
+    };
 
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     push(`[error] ${msg}`);
-    return { captured: [], logs, ip, proxy: proxyConfig || null };
+    
+    // **Even on error, return original URL so UI shows something**
+    return { 
+      captured: [{
+        url: targetUrl,
+        source: targetUrl,
+        timestamp: new Date().toISOString(),
+        method: 'error-fallback',
+        ip: ip,
+        proxy: proxyConfig || null
+      }],
+      logs: logs, 
+      ip: ip, 
+      proxy: proxyConfig || null 
+    };
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
