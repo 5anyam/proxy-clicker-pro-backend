@@ -1,12 +1,45 @@
-import { chromium } from 'playwright';
+import { chromium as playwrightChromium } from 'playwright-core';
+import chromium from '@sparticuz/chromium';
 
-// Helper: click target and capture resulting URL (new tab or navigation)
+// Launch helper using playwright-core + @sparticuz/chromium
+async function getBrowserContext(proxy) {
+  const browser = await playwrightChromium.launch({
+    executablePath: await chromium.executablePath(),
+    headless: true,
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+    ],
+  });
+
+  const contextOptions = proxy?.server
+    ? { proxy: { server: proxy.server, username: proxy.username, password: proxy.password } }
+    : {};
+
+  const context = await browser.newContext(contextOptions);
+  return { browser, context };
+}
+
+// Try to close popups/consent quickly
+async function tryDismissOverlays(page) {
+  try {
+    const accept = page.getByRole('button', { name: /accept|agree|ok|continue|got it/i }).first();
+    if (await accept.isVisible().catch(() => false)) {
+      await accept.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  } catch {}
+}
+
+// Click element and capture resulting URL (new tab or same tab)
 async function clickAndCapture(context, page, targetEl, originalUrl) {
-  // Try: new tab
+  // New tab
   try {
     const [newPage] = await Promise.all([
       context.waitForEvent('page', { timeout: 6000 }),
-      targetEl.click({ timeout: 6000 })
+      targetEl.click({ timeout: 6000 }),
     ]);
     await newPage.waitForLoadState('domcontentloaded', { timeout: 12000 });
     const url = newPage.url();
@@ -14,13 +47,13 @@ async function clickAndCapture(context, page, targetEl, originalUrl) {
     if (url && url !== 'about:blank') return url;
   } catch {}
 
-  // Fallback: same tab navigation
+  // Same tab
   try {
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => null),
-      targetEl.click({ timeout: 6000 })
+      targetEl.click({ timeout: 6000 }),
     ]);
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1000);
     const url = page.url();
     if (url && url !== originalUrl) return url;
   } catch {}
@@ -28,48 +61,23 @@ async function clickAndCapture(context, page, targetEl, originalUrl) {
   return null;
 }
 
-// Helper: best-effort to accept consent popups
-async function tryDismissOverlays(page) {
-  try {
-    const accept = page.getByRole('button', { name: /accept|agree|ok/i }).first();
-    if (await accept.isVisible().catch(() => false)) {
-      await accept.click({ timeout: 3000 }).catch(() => {});
-      await page.waitForTimeout(400);
-    }
-  } catch {}
-}
-
 export async function runAutomation(targetUrl, log, proxyConfig = null) {
   const logs = [];
-  const pushLog = (msg) => { logs.push(msg); if (typeof log === 'function') log(msg); };
+  const pushLog = (m) => { logs.push(m); if (typeof log === 'function') log(m); };
 
-  let browser;
+  let browser, context;
   let detectedIP = null;
-  let captured = [];
+  const captured = [];
 
   try {
-    pushLog('[info] Launching Playwright...');
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-
-    const contextOptions = {};
-    if (proxyConfig && proxyConfig.server) {
-      contextOptions.proxy = {
-        server: proxyConfig.server,
-        username: proxyConfig.username || undefined,
-        password: proxyConfig.password || undefined
-      };
-      pushLog(`[info] Using proxy: ${proxyConfig.server}`);
-    }
-    const context = await browser.newContext(contextOptions);
+    pushLog('[info] Launching headless Chromium (playwright-core + sparticuz)…');
+    ({ browser, context } = await getBrowserContext(proxyConfig));
     const page = await context.newPage();
 
-    // Detect IP with current route (proxy/direct)
+    // IP detection (via current route/proxy)
     try {
-      const ipResponse = await page.request.get('https://api.ipify.org?format=json', { timeout: 10000 });
-      const ipData = await ipResponse.json();
+      const ipRes = await page.request.get('https://api.ipify.org?format=json', { timeout: 10000 });
+      const ipData = await ipRes.json();
       detectedIP = ipData?.ip || null;
       pushLog(`[info] Detected IP: ${detectedIP}`);
     } catch (e) {
@@ -80,11 +88,11 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await tryDismissOverlays(page);
 
-    // Small scroll to reveal lazy content
-    await page.evaluate(() => window.scrollBy(0, 400)).catch(() => {});
-    await page.waitForTimeout(500);
+    // Small scroll for lazy content
+    try { await page.evaluate(() => window.scrollBy(0, 400)); } catch {}
+    await page.waitForTimeout(400);
 
-    // Pick main content area (ignore navbar/footer/sidebar)
+    // Identify main content area (skip header/nav/footer/sidebar)
     const contentSelectors = [
       'main',
       'article',
@@ -93,26 +101,28 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       '.content',
       '.blog-content',
       '[role="main"]',
-      '.main-content'
+      '.main-content',
     ];
     let scope = null;
     for (const sel of contentSelectors) {
-      const count = await page.locator(sel).count().catch(() => 0);
-      if (count > 0) {
-        scope = page.locator(sel).first();
-        pushLog(`[info] Content area: ${sel}`);
-        break;
-      }
+      try {
+        const count = await page.locator(sel).count();
+        if (count > 0) {
+          scope = page.locator(sel).first();
+          pushLog(`[info] Content area detected: ${sel}`);
+          break;
+        }
+      } catch {}
     }
     if (!scope) {
       scope = page.locator('body');
       pushLog('[info] Using <body> as content area (fallback)');
     }
 
-    // Collect candidate CTAs inside content area
+    // Build a prioritized list of clickable CTAs inside content
     const chosen = [];
 
-    // Priority 1: links opening new tab
+    // Priority 1: new-tab links (CTAs often open externally)
     try {
       const links = await scope.locator('a[target="_blank"][href]:visible').all();
       for (const el of links) {
@@ -125,9 +135,12 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       }
     } catch {}
 
-    // Priority 2: CTA anchors by text
+    // Priority 2: CTA anchors by common text patterns
     if (chosen.length < 3) {
-      const texts = ['Read More', 'Continue', 'Continue Reading', 'Learn More', 'View More', 'Details', 'Explore', 'Get Deal', 'Get Offer'];
+      const texts = [
+        'Read More', 'Continue', 'Continue Reading', 'Learn More',
+        'View More', 'Details', 'Explore', 'Get Deal', 'Get Offer',
+      ];
       for (const t of texts) {
         try {
           const els = await scope.getByRole('link', { name: new RegExp(t, 'i') }).all();
@@ -144,28 +157,28 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       }
     }
 
-    // Priority 3: visible button-like controls in content
+    // Priority 3: visible buttons inside content
     if (chosen.length < 3) {
       try {
         const btns = await scope.locator('button:visible, [role="button"]:visible, input[type=submit]:visible').all();
         for (const el of btns) {
-          const text = (await el.innerText().catch(() => '')).trim() ||
-                       (await el.getAttribute('value').catch(() => '')) || '';
+          const text = (await el.innerText().catch(() => '')).trim()
+            || (await el.getAttribute('value').catch(() => '')) || '';
           chosen.push({ el, kind: 'button', text, href: null });
           if (chosen.length >= 3) break;
         }
       } catch {}
     }
 
-    pushLog(`[info] Clickable candidates in content area: ${chosen.length}`);
+    pushLog(`[info] Candidates in content area: ${chosen.length}`);
 
-    // Click top 3 candidates deterministically
+    // Click at most 3 candidates and capture URL
     const MAX = Math.min(3, chosen.length);
     for (let i = 0; i < MAX; i++) {
       const ch = chosen[i];
       pushLog(`[info] Clicking: "${ch.text || ch.href || ch.kind}" [${ch.kind}]`);
-
       const newUrl = await clickAndCapture(context, page, ch.el, targetUrl);
+
       if (newUrl && newUrl !== targetUrl) {
         captured.push({
           url: newUrl,
@@ -174,20 +187,20 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
           method: ch.kind,
           buttonText: ch.text || undefined,
           ip: detectedIP,
-          proxy: proxyConfig || null
+          proxy: proxyConfig || null,
         });
-        pushLog(`[capture] Captured URL: ${newUrl}`);
+        pushLog(`[capture] ${newUrl}`);
       } else {
-        pushLog('[info] No navigation detected, retrying next candidate');
+        pushLog('[info] No navigation detected for this candidate');
       }
 
-      // Return to original for next click
+      // Reset for next candidate
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await tryDismissOverlays(page);
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(500);
     }
 
-    // If nothing captured, still return original
+    // If nothing captured, return original (prevents empty UI)
     if (captured.length === 0) {
       captured.push({
         url: targetUrl,
@@ -195,13 +208,14 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
         timestamp: new Date().toISOString(),
         method: 'none-found',
         ip: detectedIP,
-        proxy: proxyConfig || null
+        proxy: proxyConfig || null,
       });
-      pushLog('[info] No URLs captured via clicks; returning original page entry');
+      pushLog('[info] No URLs captured; returned original page entry');
     }
 
-    pushLog(`[success] Completed. Captured ${captured.length} entries`);
+    pushLog(`[success] Done. Captured ${captured.length} entries`);
     return { captured, logs, ip: detectedIP, proxy: proxyConfig || null };
+
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     pushLog(`[error] Automation failed: ${msg}`);
