@@ -1,4 +1,3 @@
-// Updated automation.js - Headless + Lightweight
 import chromium from '@sparticuz/chromium';
 import { chromium as playwright } from 'playwright-core';
 
@@ -10,10 +9,10 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
   let detectedIP = null;
 
   try {
-    // 🔥 Headless + Lightweight approach
+    // 🔥 @sparticuz/chromium - No system dependencies needed
     browser = await playwright.launch({
-      executablePath: await chromium.executablePath(), // Bundled chromium
-      headless: true, // NO BROWSER WINDOW
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless, // Always true
       args: [
         ...chromium.args,
         '--no-sandbox',
@@ -29,9 +28,7 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
 
     if (proxyConfig?.server) {
       contextOptions.proxy = proxyConfig;
-      pushLog(`[info] Headless automation with proxy: ${proxyConfig.server}`);
-    } else {
-      pushLog('[info] Headless automation without proxy');
+      pushLog(`[info] Using proxy: ${proxyConfig.server}`);
     }
 
     const context = await browser.newContext(contextOptions);
@@ -39,35 +36,35 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
 
     let capturedUrls = [];
 
-    // IP Detection (works perfectly in headless)
+    // IP Detection
     try {
-      const ipResponse = await page.request.get('https://api.ipify.org?format=json');
+      const ipResponse = await page.request.get('https://api.ipify.org?format=json', { timeout: 10000 });
       const ipData = await ipResponse.json();
       detectedIP = ipData.ip;
-      pushLog(`[info] IP detected (headless): ${detectedIP}`);
+      pushLog(`[info] IP detected: ${detectedIP}`);
     } catch (ipError) {
       pushLog(`[warning] IP detection failed: ${ipError.message}`);
     }
 
-    // Navigate and automate (all works in headless)
+    // Navigate to target
+    pushLog(`[info] Navigating to: ${targetUrl}`);
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    pushLog(`[info] Page loaded in headless mode`);
-
+    
     // Simple automation - capture current URL
     capturedUrls.push({
       url: page.url(),
       source: targetUrl,
       timestamp: new Date().toISOString(),
-      method: 'headless-navigation',
+      method: 'navigation',
       ip: detectedIP,
       proxy: proxyConfig
     });
 
-    pushLog(`[success] Headless automation completed. ${capturedUrls.length} URLs captured`);
+    pushLog(`[success] Automation completed. URLs: ${capturedUrls.length}`);
     return { captured: capturedUrls, logs, ip: detectedIP, proxy: proxyConfig };
 
   } catch (error) {
-    pushLog(`[error] Headless automation failed: ${error.message}`);
+    pushLog(`[error] Automation failed: ${error.message}`);
     throw error;
   } finally {
     if (browser) await browser.close();
