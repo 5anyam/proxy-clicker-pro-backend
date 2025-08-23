@@ -88,9 +88,21 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await tryDismissOverlays(page);
 
+    // Hide obvious non-content areas to avoid navbar/footer picks
+    await page.addStyleTag({
+      content: `
+        header, nav, footer, aside, .site-header, .site-footer, .sidebar,
+        .sticky, .cookie, .consent, .newsletter, .ads,
+        [role="banner"], [role="navigation"], [role="contentinfo"] {
+          display: none !important;
+          visibility: hidden !important;
+        }
+      `
+    }).catch(() => {});
+
     // Small scroll for lazy content
-    try { await page.evaluate(() => window.scrollBy(0, 400)); } catch {}
-    await page.waitForTimeout(400);
+    try { await page.evaluate(() => window.scrollTo(0, 0)); } catch {}
+    await page.waitForTimeout(300);
 
     // Identify main content area (skip header/nav/footer/sidebar)
     const contentSelectors = [
@@ -119,65 +131,127 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       pushLog('[info] Using <body> as content area (fallback)');
     }
 
-    // Build a prioritized list of clickable CTAs inside content
-    const chosen = [];
-
-    // Priority 1: new-tab links (CTAs often open externally)
-    try {
-      const links = await scope.locator('a[target="_blank"][href]:visible').all();
-      for (const el of links) {
-        const href = await el.getAttribute('href');
-        const text = (await el.innerText().catch(() => '')).trim();
-        if (href && !href.startsWith('#')) {
-          chosen.push({ el, kind: 'newtab', text, href });
-          if (chosen.length >= 3) break;
-        }
-      }
-    } catch {}
-
-    // Priority 2: CTA anchors by common text patterns
-    if (chosen.length < 3) {
-      const texts = [
-        'Read More', 'Continue', 'Continue Reading', 'Learn More',
-        'View More', 'Details', 'Explore', 'Get Deal', 'Get Offer',
-      ];
-      for (const t of texts) {
+    // Helper to collect candidates by selector list
+    async function collectBySelectors(selectors, label, max = 6) {
+      const results = [];
+      for (const sel of selectors) {
         try {
-          const els = await scope.getByRole('link', { name: new RegExp(t, 'i') }).all();
-          for (const el of els) {
-            const href = await el.getAttribute('href');
-            const text = (await el.innerText().catch(() => '')).trim();
-            if (href && !href.startsWith('#')) {
-              chosen.push({ el, kind: 'cta-link', text, href });
-              if (chosen.length >= 3) break;
-            }
+          const nodes = await scope.locator(sel).all();
+          for (const el of nodes) {
+            const visible = await el.isVisible().catch(() => false);
+            if (!visible) continue;
+            const text = ((await el.innerText().catch(() => '')) || '').trim();
+            const href = await el.getAttribute('href').catch(() => null);
+            results.push({ el, kind: label, text, href, sel });
+            if (results.length >= max) break;
           }
         } catch {}
-        if (chosen.length >= 3) break;
+        if (results.length >= max) break;
+      }
+      return results;
+    }
+
+    // 1) Highest priority: explicit CTAs inside content
+    const ctaTexts = [
+      'Read More', 'Continue', 'Continue Reading', 'Learn More', 'View More',
+      'Explore', 'Get Deal', 'Get Offer', 'Shop Now', 'Buy Now', 'See More',
+      'Details', 'Try Now', 'Start', 'Sign Up', 'Join'
+    ];
+
+    const candidates = [];
+
+    // A. role=link by text
+    for (const t of ctaTexts) {
+      try {
+        const els = await scope.getByRole('link', { name: new RegExp(`\\b${t}\\b`, 'i') }).all();
+        for (const el of els) {
+          const href = await el.getAttribute('href').catch(() => null);
+          const text = ((await el.innerText().catch(() => '')) || '').trim();
+          candidates.push({ el, kind: 'link-text', text, href, sel: `role=link name~"${t}"` });
+          if (candidates.length >= 6) break;
+        }
+      } catch {}
+      if (candidates.length >= 6) break;
+    }
+
+    // B. role=button by text
+    if (candidates.length < 6) {
+      for (const t of ctaTexts) {
+        try {
+          const els = await scope.getByRole('button', { name: new RegExp(`\\b${t}\\b`, 'i') }).all();
+          for (const el of els) {
+            const text = ((await el.innerText().catch(() => '')) || '').trim();
+            candidates.push({ el, kind: 'button-text', text, href: null, sel: `role=button name~"${t}"` });
+            if (candidates.length >= 6) break;
+          }
+        } catch {}
+        if (candidates.length >= 6) break;
       }
     }
 
-    // Priority 3: visible buttons inside content
-    if (chosen.length < 3) {
+    // C. common CTA classes/data-attrs
+    if (candidates.length < 6) {
+      const classSelectors = [
+        'a.btn[href]', 'a.button[href]', 'a.cta[href]', 'a.read-more[href]',
+        'button.btn', 'button.button', '[data-cta]', '[data-test*="cta"]'
+      ];
+      const cands = await collectBySelectors(classSelectors, 'cta-class', 6 - candidates.length);
+      candidates.push(...cands);
+    }
+
+    // D. new-tab anchors in content (often outbound CTAs)
+    if (candidates.length < 6) {
+      const cands = await collectBySelectors(['a[target="_blank"][href]:visible'], 'newtab', 6 - candidates.length);
+      candidates.push(...cands);
+    }
+
+    // E. any external link in content as last fallback
+    if (candidates.length < 6) {
       try {
-        const btns = await scope.locator('button:visible, [role="button"]:visible, input[type=submit]:visible').all();
-        for (const el of btns) {
-          const text = (await el.innerText().catch(() => '')).trim()
-            || (await el.getAttribute('value').catch(() => '')) || '';
-          chosen.push({ el, kind: 'button', text, href: null });
-          if (chosen.length >= 3) break;
+        const links = await scope.locator('a[href]:visible').all();
+        for (const el of links) {
+          const href = await el.getAttribute('href').catch(() => null);
+          if (!href || href.startsWith('#')) continue;
+          const abs = href.startsWith('http') ? href : new URL(href, targetUrl).toString();
+          const text = ((await el.innerText().catch(() => '')) || '').trim();
+          candidates.push({ el, kind: 'external-fallback', text, href: abs, sel: 'a[href]' });
+          if (candidates.length >= 6) break;
         }
       } catch {}
     }
 
-    pushLog(`[info] Candidates in content area: ${chosen.length}`);
+    pushLog(`[info] Total candidate CTAs found: ${candidates.length}`);
 
-    // Click at most 3 candidates and capture URL
-    const MAX = Math.min(3, chosen.length);
-    for (let i = 0; i < MAX; i++) {
-      const ch = chosen[i];
-      pushLog(`[info] Clicking: "${ch.text || ch.href || ch.kind}" [${ch.kind}]`);
-      const newUrl = await clickAndCapture(context, page, ch.el, targetUrl);
+    // SPA-aware URL change watcher wrapper
+    async function clickAndWatch(ch) {
+      const beforeUrl = page.url();
+
+      const navUrl = await clickAndCapture(context, page, ch.el, targetUrl);
+      if (navUrl) return navUrl;
+
+      try {
+        await page.waitForFunction(
+          (u) => location.href !== u, beforeUrl,
+          { timeout: 4000 }
+        ).catch(() => {});
+      } catch {}
+
+      const afterUrl = page.url();
+      if (afterUrl && afterUrl !== beforeUrl) return afterUrl;
+
+      await page.waitForTimeout(1000);
+      const finalUrl = page.url();
+      if (finalUrl && finalUrl !== beforeUrl) return finalUrl;
+
+      return null;
+    }
+
+    // Try first 3 candidates
+    const limit = Math.min(3, candidates.length);
+    for (let i = 0; i < limit; i++) {
+      const ch = candidates[i];
+      pushLog(`[info] Clicking candidate ${i + 1}/${limit}: kind=${ch.kind} sel=${ch.sel} text="${ch.text}"`);
+      const newUrl = await clickAndWatch(ch);
 
       if (newUrl && newUrl !== targetUrl) {
         captured.push({
@@ -187,20 +261,20 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
           method: ch.kind,
           buttonText: ch.text || undefined,
           ip: detectedIP,
-          proxy: proxyConfig || null,
+          proxy: proxyConfig || null
         });
         pushLog(`[capture] ${newUrl}`);
       } else {
-        pushLog('[info] No navigation detected for this candidate');
+        pushLog(`[info] No navigation captured for candidate ${i + 1}`);
       }
 
-      // Reset for next candidate
+      // Reset to original for next attempt
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await tryDismissOverlays(page);
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(400);
     }
 
-    // If nothing captured, return original (prevents empty UI)
+    // If still nothing, return original once so UI isn’t empty
     if (captured.length === 0) {
       captured.push({
         url: targetUrl,
@@ -208,7 +282,7 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
         timestamp: new Date().toISOString(),
         method: 'none-found',
         ip: detectedIP,
-        proxy: proxyConfig || null,
+        proxy: proxyConfig || null
       });
       pushLog('[info] No URLs captured; returned original page entry');
     }
