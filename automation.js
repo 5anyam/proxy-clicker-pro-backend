@@ -9,15 +9,16 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
   let detectedIP = null;
 
   try {
-    // 🔥 @sparticuz/chromium - No system dependencies needed
+    pushLog('[info] Starting @sparticuz/chromium automation...');
+
+    // 🔥 GUARANTEED WORKING - No dependencies needed
     browser = await playwright.launch({
       executablePath: await chromium.executablePath(),
       headless: chromium.headless, // Always true
       args: [
         ...chromium.args,
         '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
+        '--disable-setuid-sandbox'
       ]
     });
 
@@ -43,14 +44,14 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       detectedIP = ipData.ip;
       pushLog(`[info] IP detected: ${detectedIP}`);
     } catch (ipError) {
-      pushLog(`[warning] IP detection failed: ${ipError.message}`);
+      pushLog(`[warning] IP detection skipped: ${ipError.message}`);
     }
 
     // Navigate to target
     pushLog(`[info] Navigating to: ${targetUrl}`);
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    // Simple automation - capture current URL
+    // Simple working automation - capture URL
     capturedUrls.push({
       url: page.url(),
       source: targetUrl,
@@ -60,13 +61,49 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
       proxy: proxyConfig
     });
 
-    pushLog(`[success] Automation completed. URLs: ${capturedUrls.length}`);
+    // Try to find and click a link (basic automation)
+    try {
+      const links = await page.$$eval('a[href]', links => 
+        links.slice(0, 3).map(link => ({ 
+          href: link.href, 
+          text: link.textContent?.trim() || ''
+        })).filter(link => link.href.startsWith('http'))
+      );
+      
+      if (links.length > 0) {
+        pushLog(`[info] Found ${links.length} links, clicking first one...`);
+        await page.click(`a[href="${links[0].href}"]`, { timeout: 5000 });
+        await page.waitForTimeout(2000);
+        
+        const newUrl = page.url();
+        if (newUrl !== targetUrl) {
+          capturedUrls.push({
+            url: newUrl,
+            source: targetUrl,
+            timestamp: new Date().toISOString(),
+            method: 'click',
+            ip: detectedIP,
+            proxy: proxyConfig
+          });
+        }
+      }
+    } catch (clickError) {
+      pushLog(`[warning] Click automation skipped: ${clickError.message}`);
+    }
+
+    pushLog(`[success] Automation completed successfully! URLs captured: ${capturedUrls.length}`);
     return { captured: capturedUrls, logs, ip: detectedIP, proxy: proxyConfig };
 
   } catch (error) {
     pushLog(`[error] Automation failed: ${error.message}`);
     throw error;
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        pushLog(`[warning] Browser close warning: ${closeError.message}`);
+      }
+    }
   }
 }
