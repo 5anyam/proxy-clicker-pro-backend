@@ -1,109 +1,48 @@
-import chromium from '@sparticuz/chromium';
-import { chromium as playwright } from 'playwright-core';
+
 
 export async function runAutomation(targetUrl, log, proxyConfig = null) {
   const logs = [];
   const pushLog = (msg) => { logs.push(msg); log?.(msg); };
 
-  let browser;
-  let detectedIP = null;
-
   try {
-    pushLog('[info] Starting @sparticuz/chromium automation...');
+    pushLog('[info] Starting HTTP-based automation (No browser needed)...');
 
-    // 🔥 GUARANTEED WORKING - No dependencies needed
-    browser = await playwright.launch({
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless, // Always true
-      args: [
-        ...chromium.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
-      ]
+    // Simple HTTP request
+    const response = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
     });
 
-    const contextOptions = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      viewport: { width: 1280, height: 720 }
-    };
-
-    if (proxyConfig?.server) {
-      contextOptions.proxy = proxyConfig;
-      pushLog(`[info] Using proxy: ${proxyConfig.server}`);
-    }
-
-    const context = await browser.newContext(contextOptions);
-    const page = await context.newPage();
-
-    let capturedUrls = [];
-
-    // IP Detection
-    try {
-      const ipResponse = await page.request.get('https://api.ipify.org?format=json', { timeout: 10000 });
-      const ipData = await ipResponse.json();
-      detectedIP = ipData.ip;
-      pushLog(`[info] IP detected: ${detectedIP}`);
-    } catch (ipError) {
-      pushLog(`[warning] IP detection skipped: ${ipError.message}`);
-    }
-
-    // Navigate to target
-    pushLog(`[info] Navigating to: ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const html = await response.text();
     
-    // Simple working automation - capture URL
-    capturedUrls.push({
-      url: page.url(),
+    // Extract links from HTML
+    const linkRegex = /<a[^>]+href\s*=\s*['"]\s*([^'"]+)\s*['"]/gi;
+    const matches = [...html.matchAll(linkRegex)];
+    
+    const capturedUrls = matches.slice(0, 5).map(match => ({
+      url: match[1].startsWith('http') ? match[21] : `${new URL(targetUrl).origin}${match[21]}`,
       source: targetUrl,
       timestamp: new Date().toISOString(),
-      method: 'navigation',
-      ip: detectedIP,
+      method: 'http-scraping',
       proxy: proxyConfig
-    });
+    }));
 
-    // Try to find and click a link (basic automation)
+    // Simple IP detection
+    let detectedIP = null;
     try {
-      const links = await page.$$eval('a[href]', links => 
-        links.slice(0, 3).map(link => ({ 
-          href: link.href, 
-          text: link.textContent?.trim() || ''
-        })).filter(link => link.href.startsWith('http'))
-      );
-      
-      if (links.length > 0) {
-        pushLog(`[info] Found ${links.length} links, clicking first one...`);
-        await page.click(`a[href="${links[0].href}"]`, { timeout: 5000 });
-        await page.waitForTimeout(2000);
-        
-        const newUrl = page.url();
-        if (newUrl !== targetUrl) {
-          capturedUrls.push({
-            url: newUrl,
-            source: targetUrl,
-            timestamp: new Date().toISOString(),
-            method: 'click',
-            ip: detectedIP,
-            proxy: proxyConfig
-          });
-        }
-      }
-    } catch (clickError) {
-      pushLog(`[warning] Click automation skipped: ${clickError.message}`);
+      const ipResponse = await fetch('https://api.ipify.org?format=json');
+      const ipData = await ipResponse.json();
+      detectedIP = ipData.ip;
+    } catch (ipError) {
+      pushLog(`[warning] IP detection failed: ${ipError.message}`);
     }
 
-    pushLog(`[success] Automation completed successfully! URLs captured: ${capturedUrls.length}`);
+    pushLog(`[success] HTTP automation completed! ${capturedUrls.length} URLs found`);
     return { captured: capturedUrls, logs, ip: detectedIP, proxy: proxyConfig };
 
   } catch (error) {
-    pushLog(`[error] Automation failed: ${error.message}`);
+    pushLog(`[error] HTTP automation failed: ${error.message}`);
     throw error;
-  } finally {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (closeError) {
-        pushLog(`[warning] Browser close warning: ${closeError.message}`);
-      }
-    }
   }
 }
