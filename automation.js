@@ -19,6 +19,15 @@ export async function runAutomation(targetUrl, log, proxyConfig = null) {
     // Extract links from HTML
     const linkRegex = /<a[^>]+href\s*=\s*['"]\s*([^'"]+)\s*['"]/gi;
     const matches = [...html.matchAll(linkRegex)];
+
+    capturedUrls.push({
+      url: typeof finalUrl === 'string' ? finalUrl : finalUrl.toString(),
+      source: typeof targetUrl === 'string' ? targetUrl : targetUrl.toString(),
+      timestamp: new Date().toISOString(),
+      method: 'navigation',
+      ip: detectedIP,
+      proxy: proxyConfig
+    });
     
     const capturedUrls = matches.slice(0, 5).map(match => ({
       url: match[1].startsWith('http') ? match[21] : `${new URL(targetUrl).origin}${match[21]}`,
