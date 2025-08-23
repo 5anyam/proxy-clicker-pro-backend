@@ -4,6 +4,8 @@ import cors from 'cors';
 import { nanoid } from 'nanoid';
 import { runAutomation } from './automation.js';
 import { buildWorkbookBuffer } from './excel.js';
+import { debugScan } from './debugScan.js';
+
 
 const app = express();
 
@@ -85,6 +87,20 @@ app.get('/', (req, res) => {
     ]
   });
 });
+
+app.post('/api/debug-scan', async (req, res) => {
+  const { url, proxy } = req.body || {};
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ ok: false, error: 'Missing or invalid url' });
+  }
+  try {
+    const result = await debugScan(url, proxy || null);
+    return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // Health check
 app.get('/api/health', (req, res) => {
